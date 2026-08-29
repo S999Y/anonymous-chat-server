@@ -1,0 +1,6 @@
+{
+  "name": "BABAVONDO",
+  "description": "Instant anonymous messaging for the lab exam and beyond. Fast, private, and secure.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

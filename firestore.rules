@@ -1,0 +1,133 @@
+﻿rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidRoomCode(code) {
+      return code is string && code.size() == 4 && code.matches('^[A-Z0-9]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Room Rules
+    match /rooms/{roomCode} {
+      function isValidRoom(data) {
+        return data.keys().hasAll(['code', 'createdAt'])
+          && data.keys().size() <= 3
+          && data.code == roomCode
+          && isValidRoomCode(data.code)
+          && data.createdAt == request.time;
+      }
+
+      allow get: if isSignedIn() && isValidRoomCode(roomCode);
+      allow create: if isSignedIn() && isValidRoomCode(roomCode) && isValidRoom(incoming());
+      allow update: if isSignedIn() && isValidRoomCode(roomCode) 
+        && incoming().diff(existing()).affectedKeys().hasOnly(['lastActivity'])
+        && incoming().lastActivity == request.time;
+
+      // Messages subcollection
+      match /messages/{messageId} {
+        function isValidFileMeta(f) {
+          return f.name is string && f.name.size() > 0 && f.name.size() <= 260
+            && f.type is string && f.type.size() <= 100
+            && f.size is int && f.size >= 0 && f.size <= 20971520
+            && f.fileId is string && f.fileId.size() > 0 && f.fileId.size() <= 64
+            && f.totalParts is int && f.totalParts > 0 && f.totalParts <= 500
+            && f.partSize is int && f.partSize > 0
+            && f.masterHash is string && f.masterHash.size() == 64;
+        }
+
+        function isValidMessage(data) {
+          let hasText = data.keys().hasAny(['text']);
+          let hasFile = data.keys().hasAny(['file']);
+          let hasReadBy = data.keys().hasAny(['readBy']);
+          return (hasText || hasFile)
+            && data.keys().hasAll(['senderId', 'senderName', 'senderColor', 'createdAt'])
+            && (data.keys().size() >= 5 && data.keys().size() <= 8)
+            && (!hasText || (data.text is string && data.text.size() <= 50000))
+            && (!hasFile || isValidFileMeta(data.file))
+            && (!hasReadBy || (data.readBy is list && data.readBy.size() <= 100))
+            && data.senderId == request.auth.uid
+            && data.senderName is string && data.senderName.size() <= 50
+            && data.senderColor is string && data.senderColor.size() <= 20
+            && data.createdAt == request.time;
+        }
+
+        allow list: if isSignedIn() && isValidRoomCode(roomCode);
+        allow create: if isSignedIn() && isValidRoomCode(roomCode) && isValidMessage(incoming());
+        allow update: if isSignedIn() && isValidRoomCode(roomCode)
+          && incoming().diff(existing()).affectedKeys().hasOnly(['readBy'])
+          && incoming().readBy is list
+          && incoming().readBy.size() > existing().get('readBy', []).size()
+          && (existing().get('readBy', []).size() == 0 || incoming().readBy.hasAll(existing().readBy))
+          && request.auth.uid in incoming().readBy;
+
+        // Split file parts stored under the message (each a base64 chunk).
+        match /parts/{partIndex} {
+          function isValidPart(data) {
+            return data.keys().hasAll(['index', 'data'])
+              && data.keys().size() == 2
+              && data.index is int && data.index > 0 && data.index <= 500
+              && data.data is string && data.data.size() > 0 && data.data.size() <= 1000000;
+          }
+
+          allow list: if isSignedIn() && isValidRoomCode(roomCode);
+          allow get: if isSignedIn() && isValidRoomCode(roomCode);
+          allow create: if isSignedIn() && isValidRoomCode(roomCode) && isValidPart(incoming());
+        }
+      }
+    }
+
+    // Inbox Rules
+    match /inboxes/{userId} {
+      function isValidInbox(data) {
+        return data.keys().hasAll(['ownerId', 'username', 'createdAt'])
+          && data.keys().size() == 3
+          && data.ownerId == userId
+          && data.username is string && data.username.size() > 0 && data.username.size() <= 100
+          && data.createdAt == request.time;
+      }
+
+      allow get: if isSignedIn() && isValidId(userId);
+      allow create: if isSignedIn() && request.auth.uid == userId && isValidInbox(incoming());
+
+      match /messages/{messageId} {
+        function isValidInboxMessage(data) {
+          let hasReadBy = data.keys().hasAny(['readBy']);
+          return data.keys().hasAll(['text', 'senderId', 'createdAt'])
+            && (data.keys().size() == 3 || data.keys().size() == 4)
+            && data.text is string && data.text.size() > 0 && data.text.size() <= 1000
+            && data.senderId is string && data.senderId.size() <= 128
+            && data.createdAt == request.time
+            && (!hasReadBy || (data.readBy is list && data.readBy.size() <= 100));
+        }
+
+        allow list: if isSignedIn() && request.auth.uid == userId;
+        allow create: if isSignedIn() && isValidInboxMessage(incoming());
+        allow update: if isSignedIn() && request.auth.uid == userId
+          && incoming().diff(existing()).affectedKeys().hasOnly(['readBy'])
+          && incoming().readBy is list;
+        allow delete: if isSignedIn() && request.auth.uid == userId;
+      }
+    }
+  }
+}
