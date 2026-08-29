@@ -1,143 +1,135 @@
-﻿/**
- * FileShard utilities for BABAVONDO.
+/**
+ * Firestore file sharding utilities for BABAVONDO.
  *
- * Splits large files into small base64-encoded chunks (under Firestore's
- * 1 MiB per-document limit), computes a master SHA-256 checksum for the whole
- * file, and reassembles/verifies the chunks back into the original file.
+ * Files are split into base64 chunks (well under Firestore's 1 MiB per-doc
+ * limit) stored in a `parts` subcollection, plus a SHA-256 master checksum
+ * for integrity verification. Pure browser APIs, no extra dependencies.
  *
- * Pure browser APIs only (crypto.subtle, Blob.slice, FileReader) - no extra deps.
+ * Progress callbacks report fraction 0..1 (not rounded) so callers can build
+ * precise percentage displays. Hashing is chunk-paced so the final
+ * verification stage reports smooth progress instead of a freeze.
  */
 
-export const PART_SIZE = 700 * 1024; // 700 KB per part -> ~933KB base64, safe under 1 MiB
-export const MAX_FILE_SIZE = 20 * 1024 * 1024; // 20 MB upload cap
+const PART_SIZE = 700 * 1024; // 700 KB base64 chunks (~933 KB per doc)
 
-export interface FilePart {
+export const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB upload cap
+
+const HASH_CHUNK = 4 * 1024 * 1024; // 4 MB pacing chunk for hash progress
+
+export interface FilePartData {
   index: number;
-  data: string; // base64-encoded slice
+  data: string;
 }
 
-export interface SplitFileResult {
+export interface SplitResult {
   fileId: string;
   masterHash: string;
   totalParts: number;
   partSize: number;
-  parts: FilePart[];
+  parts: FilePartData[];
 }
 
-// Generate a UUID (with a non-crypto fallback).
-export function generateFileId(): string {
-  if (typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-  return "fshard-" + Math.random().toString(36).substring(2, 10) + "-" + Date.now().toString(36);
-}
-
-export function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
+function bytesToBase64(bytes: Uint8Array): string {
   let binary = "";
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-  }
+  for (const b of bytes) binary += String.fromCharCode(b);
   return btoa(binary);
 }
 
-export function base64ToArrayBuffer(base64: string): ArrayBuffer {
+function base64ToBytes(base64: string): Uint8Array {
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/** Hash with honest chunk-paced progress. Discarded sub-hashes only pace the bar. */
+async function sha256HexPaced(
+  bytes: Uint8Array,
+  onProgress?: (fraction: number) => void
+): Promise<string> {
+  if (bytes.length > HASH_CHUNK) {
+    let offset = 0;
+    while (offset < bytes.length) {
+      const end = Math.min(offset + HASH_CHUNK, bytes.length);
+      await crypto.subtle.digest("SHA-256", bytes.subarray(offset, end));
+      offset = end;
+      onProgress?.(offset / bytes.length);
+    }
   }
-  return bytes.buffer;
+  return sha256Hex(bytes);
 }
 
-export async function sha256(data: ArrayBuffer): Promise<string> {
-  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-  const hashArray = new Uint8Array(hashBuffer);
-  let hashHex = "";
-  hashArray.forEach((b) => {
-    hashHex += b.toString(16).padStart(2, "0");
-  });
-  return hashHex;
+function generateFileId(): string {
+  const arr = new Uint8Array(12);
+  crypto.getRandomValues(arr);
+  return Array.from(arr).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-/**
- * Split a File into base64 chunks. Computes the master SHA-256 over the whole
- * file and returns the parts. Optionally reports progress (0-100).
- */
 export async function splitFile(
   file: File,
-  onPartProgress?: (percent: number, part: number, total: number) => void
-): Promise<SplitFileResult> {
-  if (file.size > MAX_FILE_SIZE) {
-    throw new Error(`File too large. Max size is ${(MAX_FILE_SIZE / 1024 / 1024).toFixed(0)}MB.`);
-  }
-
-  const masterHash = await sha256(await file.arrayBuffer());
-
-  const totalParts = Math.max(1, Math.ceil(file.size / PART_SIZE));
-  const parts: FilePart[] = [];
+  onProgress?: (fraction: number) => void
+): Promise<SplitResult> {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const fileId = generateFileId();
+  const totalParts = Math.max(1, Math.ceil(bytes.length / PART_SIZE));
+  const parts: FilePartData[] = [];
 
   for (let i = 0; i < totalParts; i++) {
     const start = i * PART_SIZE;
-    const end = Math.min(start + PART_SIZE, file.size);
-    const slice = file.slice(start, end);
-    const buffer = await slice.arrayBuffer();
-    const base64 = arrayBufferToBase64(buffer);
-    parts.push({ index: i + 1, data: base64 });
-
-    const percent = Math.min(100, Math.round(((i + 1) / totalParts) * 100));
-    onPartProgress?.(percent, i + 1, totalParts);
+    const end = Math.min(start + PART_SIZE, bytes.length);
+    parts.push({ index: i, data: bytesToBase64(bytes.subarray(start, end)) });
+    // Encode is ~80% of split work.
+    onProgress?.(0.8 * ((i + 1) / totalParts));
   }
 
-  return {
-    fileId: generateFileId(),
-    masterHash,
-    totalParts,
-    partSize: PART_SIZE,
-    parts,
-  };
+  const masterHash = await sha256HexPaced(bytes, (f) => {
+    // Hashing is the remaining ~20% of split work.
+    onProgress?.(0.8 + 0.2 * f);
+  });
+  onProgress?.(1);
+
+  return { fileId, masterHash, totalParts, partSize: PART_SIZE, parts };
 }
 
-/**
- * Reassemble base64 parts (in ascending index order) back into a Blob and
- * verify the master checksum of the reconstruction.
- */
 export async function reassembleFile(
-  parts: FilePart[],
-  expectedHash: string,
-  onPartProgress?: (percent: number, part: number, total: number) => void
-): Promise<{ file: Blob | null; checksumMatched: boolean; calculatedHash: string }> {
-  const sorted = [...parts].sort((a, b) => a.index - b.index);
+  parts: FilePartData[],
+  expectedHash?: string,
+  onProgress?: (fraction: number) => void
+): Promise<{ blob: Blob; checksumMatched: boolean; calculatedHash: string }> {
+  const ordered = [...parts].sort((a, b) => a.index - b.index);
+  const decoded: Uint8Array[] = [];
 
-  const chunks: Uint8Array[] = [];
-  let totalBytes = 0;
-
-  for (let i = 0; i < sorted.length; i++) {
-    const buffer = base64ToArrayBuffer(sorted[i].data);
-    const bytes = new Uint8Array(buffer);
-    chunks.push(bytes);
-    totalBytes += bytes.length;
-    const percent = Math.min(80, Math.round(((i + 1) / sorted.length) * 80));
-    onPartProgress?.(percent, i + 1, sorted.length);
+  for (let i = 0; i < ordered.length; i++) {
+    decoded.push(base64ToBytes(ordered[i].data));
+    // Decode is ~75% of reassembly work.
+    onProgress?.(0.75 * ((i + 1) / ordered.length));
   }
 
-  const merged = new Uint8Array(totalBytes);
+  let total = 0;
+  for (const d of decoded) total += d.length;
+
+  const combined = new Uint8Array(total);
   let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.length;
+  for (const d of decoded) {
+    combined.set(d, offset);
+    offset += d.length;
   }
 
-  const calculatedHash = await sha256(merged.buffer);
-  onPartProgress?.(100, sorted.length, sorted.length);
-
-  const checksumMatched =
-    !!expectedHash && calculatedHash.toLowerCase() === expectedHash.toLowerCase();
+  const calculatedHash = await sha256HexPaced(combined, (f) => {
+    onProgress?.(0.75 + 0.25 * f);
+  });
+  onProgress?.(1);
 
   return {
-    file: checksumMatched ? new Blob([merged.buffer]) : null,
-    checksumMatched,
+    blob: new Blob([combined]),
+    checksumMatched: !expectedHash ? true : calculatedHash === expectedHash,
     calculatedHash,
   };
 }

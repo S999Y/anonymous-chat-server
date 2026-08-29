@@ -58,26 +58,13 @@
           "properties": {
             "name": { "type": "string", "description": "Original file name (1-260 chars)." },
             "type": { "type": "string", "description": "MIME type." },
-            "size": { "type": "integer", "description": "Total file size in bytes (max 20 MB)." },
-            "fileId": { "type": "string", "description": "Unique identifier for this file." },
-            "totalParts": { "type": "integer", "description": "Number of chunks the file was split into." },
-            "partSize": { "type": "integer", "description": "Byte size of each chunk (700 KB)." },
-            "masterHash": { "type": "string", "description": "SHA-256 checksum of the whole file." }
+            "size": { "type": "integer", "description": "Total file size in bytes (max 30 MB)." },
+            "path": { "type": "string", "description": "Firebase Storage path: chat/{roomCode}/{messageId}." }
           },
-          "description": "Metadata for an attached file. The actual data is stored as base64 chunks in the 'parts' subcollection."
+          "description": "Metadata for an attached file. The binary blob is stored in Firebase Storage at the 'path'."
         }
       },
       "required": ["senderId", "senderName", "createdAt"]
-    },
-    "FilePart": {
-      "title": "File Chunk",
-      "description": "A single base64-encoded chunk of a split file.",
-      "type": "object",
-      "properties": {
-        "index": { "type": "integer", "description": "1-based index of the chunk." },
-        "data": { "type": "string", "description": "Base64-encoded chunk of the file." }
-      },
-      "required": ["index", "data"]
     },
     "Inbox": {
       "title": "Anonymous Inbox",
@@ -116,10 +103,6 @@
       "schema": "Message",
       "description": "Storage for messages within a specific room."
     },
-    "/rooms/{roomCode}/messages/{messageId}/parts/{partIndex}": {
-      "schema": "FilePart",
-      "description": "Base64-encoded chunks of a file attached to a room message."
-    },
     "/inboxes/{userId}": {
       "schema": "Inbox",
       "description": "User's anonymous inbox configuration."
@@ -127,6 +110,11 @@
     "/inboxes/{userId}/messages/{messageId}": {
       "schema": "InboxMessage",
       "description": "Messages received via the anonymous public link."
+    }
+  },
+  "storage": {
+    "/chat/{roomCode}/{messageId}": {
+      "description": "Binary blob attachment for a room message (max 30 MB)."
     }
   }
 }
