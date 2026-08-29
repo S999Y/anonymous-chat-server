@@ -1,4 +1,4 @@
-﻿rules_version = '2';
+rules_version = '2';
 
 service cloud.firestore {
   match /databases/{database}/documents {
@@ -47,52 +47,81 @@ service cloud.firestore {
       // Messages subcollection
       match /messages/{messageId} {
         function isValidFileMeta(f) {
-          return f.name is string && f.name.size() > 0 && f.name.size() <= 260
+          return f.keys().hasAll(['name', 'type', 'size', 'fileId', 'totalParts', 'partSize', 'masterHash'])
+            && f.keys().size() == 7
+            && f.name is string && f.name.size() > 0 && f.name.size() <= 260
             && f.type is string && f.type.size() <= 100
-            && f.size is int && f.size >= 0 && f.size <= 20971520
-            && f.fileId is string && f.fileId.size() > 0 && f.fileId.size() <= 64
-            && f.totalParts is int && f.totalParts > 0 && f.totalParts <= 500
-            && f.partSize is int && f.partSize > 0
-            && f.masterHash is string && f.masterHash.size() == 64;
+            && f.size is int && f.size >= 0 && f.size <= 52428800
+            && isValidId(f.fileId)
+            && f.totalParts is int && f.totalParts >= 1 && f.totalParts <= 256
+            && f.partSize is int && f.partSize > 0 && f.partSize <= 1048576
+            && f.masterHash is string && f.masterHash.size() == 64 && f.masterHash.matches('^[a-f0-9]{64}$');
         }
 
         function isValidMessage(data) {
           let hasText = data.keys().hasAny(['text']);
           let hasFile = data.keys().hasAny(['file']);
           let hasReadBy = data.keys().hasAny(['readBy']);
+          let hasComplete = data.keys().hasAny(['uploadComplete']);
           return (hasText || hasFile)
             && data.keys().hasAll(['senderId', 'senderName', 'senderColor', 'createdAt'])
             && (data.keys().size() >= 5 && data.keys().size() <= 8)
             && (!hasText || (data.text is string && data.text.size() <= 50000))
             && (!hasFile || isValidFileMeta(data.file))
             && (!hasReadBy || (data.readBy is list && data.readBy.size() <= 100))
+            && (!hasComplete || data.uploadComplete is bool)
             && data.senderId == request.auth.uid
             && data.senderName is string && data.senderName.size() <= 50
             && data.senderColor is string && data.senderColor.size() <= 20
             && data.createdAt == request.time;
         }
 
-        allow list: if isSignedIn() && isValidRoomCode(roomCode);
-        allow create: if isSignedIn() && isValidRoomCode(roomCode) && isValidMessage(incoming());
-        allow update: if isSignedIn() && isValidRoomCode(roomCode)
-          && incoming().diff(existing()).affectedKeys().hasOnly(['readBy'])
-          && incoming().readBy is list
-          && incoming().readBy.size() > existing().get('readBy', []).size()
-          && (existing().get('readBy', []).size() == 0 || incoming().readBy.hasAll(existing().readBy))
-          && request.auth.uid in incoming().readBy;
+        function readByOK(data) {
+          return data.diff(existing()).affectedKeys().hasOnly(['readBy'])
+            && data.readBy is list
+            && data.readBy.size() > existing().get('readBy', []).size()
+            && (existing().get('readBy', []).size() == 0 || data.readBy.hasAll(existing().readBy))
+            && request.auth.uid in data.readBy;
+        }
 
-        // Split file parts stored under the message (each a base64 chunk).
+        function finalizeOK(data) {
+          return data.diff(existing()).affectedKeys().hasOnly(['uploadComplete'])
+            && data.uploadComplete == true
+            && existing().get('uploadComplete', false) == false
+            && data.senderId == request.auth.uid;
+        }
+
+        allow list: if isSignedIn() && isValidRoomCode(roomCode);
+        allow create: if isSignedIn() && isValidRoomCode(roomCode) && isValidMessage(incoming())
+          && incoming().get('uploadComplete', false) == false;
+        allow update: if isSignedIn() && isValidRoomCode(roomCode)
+          && incoming().diff(existing()).affectedKeys().hasOnly(['readBy', 'uploadComplete'])
+          && (readByOK(incoming()) || finalizeOK(incoming()));
+        allow delete: if isSignedIn() && isValidRoomCode(roomCode)
+          && existing().senderId == request.auth.uid;
+
+        // File part shards: messages/{messageId}/parts/{index}
         match /parts/{partIndex} {
-          function isValidPart(data) {
-            return data.keys().hasAll(['index', 'data'])
-              && data.keys().size() == 2
-              && data.index is int && data.index > 0 && data.index <= 500
-              && data.data is string && data.data.size() > 0 && data.data.size() <= 1000000;
+          function parentMeta() {
+            return get(/databases/$(database)/documents/rooms/$(roomCode)/messages/$(messageId)).data;
           }
 
-          allow list: if isSignedIn() && isValidRoomCode(roomCode);
-          allow get: if isSignedIn() && isValidRoomCode(roomCode);
-          allow create: if isSignedIn() && isValidRoomCode(roomCode) && isValidPart(incoming());
+          function isValidPart(data) {
+            return data.keys().hasAll(['index', 'data', 'createdAt'])
+              && data.keys().size() == 3
+              && data.index is int && data.index >= 0 && data.index == int(partIndex)
+              && data.data is string && data.data.size() > 0 && data.data.size() <= 1048576
+              && data.createdAt == request.time;
+          }
+
+          allow list: if isSignedIn() && isValidRoomCode(roomCode) && isValidId(messageId);
+          allow get: if isSignedIn() && isValidRoomCode(roomCode) && isValidId(messageId);
+          allow create: if isSignedIn() && isValidRoomCode(roomCode) && isValidId(messageId)
+            && isValidPart(incoming())
+            && parentMeta().file.totalParts is int
+            && int(partIndex) < parentMeta().file.totalParts;
+          allow delete: if isSignedIn() && isValidRoomCode(roomCode) && isValidId(messageId)
+            && parentMeta().senderId == request.auth.uid;
         }
       }
     }

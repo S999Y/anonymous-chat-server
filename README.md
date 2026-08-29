@@ -9,7 +9,7 @@ BABAVONDO is a real-time anonymous chat platform that lets users join ephemeral 
 ## Features
 
 - **Room-based anonymous chat** — Create or join a room via an easy-to-remember 4-character code and start chatting instantly. No sign-up required.
-- **File sharing up to 20 MB** — Files are split into small, verifiable chunks and reassembled with integrity checks (SHA-256 master hash) on download.
+- **File sharing up to 30 MB** — Files are stored in Firebase Storage (no base64 overhead, no sharding) and streamed on download.
 - **Read receipts** — Track who has read each message within a room.
 - **Public inboxes** — Create a public inbox and share a link so anyone can leave an anonymous message without joining a room.
 - **Built-in AI assistant** — Chat with Gemini directly inside the platform via a bundled server-side endpoint.
@@ -25,6 +25,7 @@ BABAVONDO is a real-time anonymous chat platform that lets users join ephemeral 
 | Frontend   | React 19, Vite 6, Tailwind CSS 4, Motion    |
 | Backend    | Express (Node.js), esbuild                  |
 | Database   | Firebase Firestore                          |
+| Storage    | Firebase Storage (file attachments)         |
 | Auth       | Firebase Authentication (anonymous sign-in) |
 | AI         | Google Gemini (server-side integration)     |
 | Deployment | Vercel (frontend + API rewrites)            |
@@ -36,16 +37,17 @@ BABAVONDO is a real-time anonymous chat platform that lets users join ephemeral 
 ### Prerequisites
 
 - [Node.js](https://nodejs.org/) 18+ and npm
-- A [Firebase](https://firebase.google.com/) project with **Firestore** and **Authentication** enabled
+- A [Firebase](https://firebase.google.com/) project with **Firestore**, **Storage**, and **Authentication** enabled
 - A [Google AI Studio](https://aistudio.google.com/) API key (for the Gemini assistant)
 
 #### Firebase setup
 
 1. In the [Firebase console](https://console.firebase.google.com/), create a project.
 2. Enable **Firestore Database** and note the database ID used by your project.
-3. In **Authentication → Sign-in method**, enable **Anonymous sign-in** (required for the app to run).
-4. Register a **Web App** and copy its config into `firebase-applet-config.json` (see below).
-5. Deploy the security rules from `firestore.rules` (see [Firestore Security Rules](#firestore-security-rules)).
+3. **Set up Firebase Storage** — open **Storage → Get Started** to create the default bucket (required for file attachments).
+4. In **Authentication → Sign-in method**, enable **Anonymous sign-in** (required for the app to run).
+5. Register a **Web App** and copy its config into `firebase-applet-config.json` (see below).
+6. Deploy the security rules from `firestore.rules` and `storage.rules` (see [Security Rules](#security-rules)).
 
 ### Installation
 
@@ -73,6 +75,13 @@ Your Firebase configuration is provided in `firebase-applet-config.json`. It is 
   "firestoreDatabaseId": "(default)"
 }
 ```
+
+> **Important:** `firebase-applet-config.json` is **git-ignored** (it contains your app identifiers/API key). It is **not committed** to version control. To set up:
+>
+> 1. Copy the template: `cp firebase-applet-config.example.json firebase-applet-config.json`
+> 2. Fill in your real values from the Firebase console → Project settings → Your apps.
+>
+> Because it's not committed, **you must create it manually on any fresh clone and on Vercel** (via your build/provisioning process) or the build will fail.
 
 > **Note:** The `firestoreDatabaseId` must match the database your rules were deployed to. Anonymous sign-in must be enabled in Firebase Authentication for the app to work.
 
@@ -111,15 +120,17 @@ The app will be served at `http://localhost:3000`.
 │   ├── context/               # React context (music, etc.)
 │   ├── lib/
 │   │   ├── firebase.ts        # Firebase init, auth, error helpers
-│   │   ├── fileShard.ts       # File splitting/checksum utilities
+│   │   ├── fileStorage.ts     # Firebase Storage upload/download helpers
 │   │   └── utils.ts           # Shared utilities
 │   ├── App.tsx                # Root app component
 │   └── main.tsx               # App entry point
 ├── server.ts                        # Express + Vite development/production server
 ├── firestore.rules                  # Firestore security rules (deploy target)
-├── firebase.json                    # Firebase project config (rules path + database)
-├── firebase-applet-config.json      # Firebase web-app config used by the client
-├── firebase-blueprint.json          # Firestore data-model blueprint (entities & paths)
+├── storage.rules                    # Firebase Storage security rules (deploy target)
+├── firebase.json                    # Firebase project config (rules paths)
+├── firebase-applet-config.json          # Firebase web-app config (git-ignored — not committed)
+├── firebase-applet-config.example.json  # Config template (committed, fill in real values)
+├── firebase-blueprint.json              # Firestore data-model blueprint (entities & paths)
 ├── vercel.json                      # Vercel rewrites (API + SPA)
 └── vite.config.ts                   # Vite configuration
 ```
@@ -131,7 +142,7 @@ The app will be served at `http://localhost:3000`.
 BABAVONDO deploys in two parts:
 
 1. **The web app + API** → **Vercel** (frontend, Gemini API serverless function)
-2. **Firestore security rules** → **Firebase**
+2. **Security rules (Firestore + Storage)** → **Firebase**
 
 ### 1. Deploy the app to Vercel
 
@@ -146,15 +157,16 @@ Or manually:
 
 > `vercel.json` rewrites `/api/*` to the serverless function (the Gemini chat handler) and routes all other traffic to the SPA.
 
-### 2. Deploy the Firestore rules to Firebase
+### 2. Deploy the security rules to Firebase
 
-The app reads/writes through **Firestore Security Rules**; without them deployed, requests will fail. See [Firestore Security Rules](#firestore-security-rules) for the exact commands.
+The app reads/writes through **Firestore** and **Firebase Storage** security rules; without them deployed, requests will fail. See [Security Rules](#security-rules) for the exact commands.
 
 ---
 
-## Firestore Security Rules
+## Security Rules
 
-Firestore rules are defined in `firestore.rules`. They enforce default-deny access, validate room codes, message schemas, file metadata, and inbox ownership, and they permit file writes only into the `parts` subcollection.
+- **`firestore.rules`** (Firestore) — default-deny access, validation of room codes, message schemas, file metadata, and inbox ownership.
+- **`storage.rules`** (Firebase Storage) — signed-in users may read and upload files under `chat/{roomCode}/{messageId}` up to 30 MB.
 
 ### Deploying rules
 
@@ -171,13 +183,13 @@ firebase login
 firebase use --add
 ```
 
-Deploy only the Firestore security rules:
+Deploy the security rules:
 
 ```bash
-firebase deploy --only firestore:rules --project gen-lang-client-0693970535
+firebase deploy --only firestore:rules,storage:rules --project anynomous-chat-9099f
 ```
 
-> The project ID is `gen-lang-client-0693970535` (see `firebase-applet-config.json`). The rules target the named Firestore database `ai-studio-07ac662d-e6fb-4d41-ba61-18a658675fd5`, defined in `firebase.json`. Always run deploys from the project root so `firebase.json` is found.
+> The project ID is `anynomous-chat-9099f` (see `firebase-applet-config.json`), and rules deploy to the `(default)` Firestore database and the default Storage bucket. Always run deploys from the project root so `firebase.json` is found. **Firebase Storage must first be set up in the console** (Storage → Get Started).
 
 ---
 
