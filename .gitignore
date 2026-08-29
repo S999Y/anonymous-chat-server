@@ -4,7 +4,6 @@ dist/
 coverage/
 .DS_Store
 *.log
-.env*
 !.env.example
 
 # Firebase & Vercel local artifacts
@@ -14,3 +13,12 @@ firebase-debug.log
 .vercel/
 .middleware/*
 
+# Credentials / Firebase config (contains API key & app identifiers)
+firebase-applet-config.json
+*.service-account.json
+*.pem
+*.key
+*.p12
+*credential*
+
+config.bat
